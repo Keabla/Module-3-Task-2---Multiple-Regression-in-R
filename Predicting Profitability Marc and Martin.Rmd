@@ -1,0 +1,280 @@
+
+
+---
+title: "Predicting Profitability"
+author: "Marc Soler and Martin Albaek"
+date: "15/2/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+The aim of this Machine Learning project is to predict the volume sales of new products never sold before. We were asked by Danielle Sherman, CTO of Blackwell Electronics (an electronics retailer) to predict the sales in four different product types (PC, Laptops, Netbooks and Smartphones).
+
+The approach to solve the problem is as follows:
+An exploratory analysis of the dataset, identify relevant product features, cleaning data and visualizing distributions.
+Building and training Machine Learning Models with different algorithms (RF, ...)
+Datasets and the complete code can be downloaded at the appendix.
+
+## Investigating the dataset
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+#import relevant libraries 
+library(readxl)
+library(caret)
+library(corrplot)
+library(ggplot2)
+library(RColorBrewer)
+library(kernlab)
+library(randomForest)
+library(gbm)
+library(plyr)
+library(dplyr)
+library(reshape2)
+
+#import data
+existing_atributes <- read.csv('existingproductattributes20172.csv')
+```
+
+
+```{r}
+#This will show the structure of the dataset, to give us an overview of what is ahead
+glimpse(existing_atributes) 
+```
+
+###Check for unique product types
+```{r}
+if (length(unique(existing_atributes$ProductNum)) == nrow(existing_atributes)) {
+  print(paste("There are", length(unique(existing_atributes$ProductNum)), "unique ProductNum values out of", nrow(existing_atributes), "observations."))
+  } else { (print("CHECK: There is at least 1 repeated ID value in the 80 observations."))
+  }
+```
+###Check how sales volume is distributed accross different product types
+```{r}
+#plot histograms for all product sales volume to see outliers
+products <- unique(existing_atributes$ProductType)
+par(mfrow=c(4,3), par(mar=c(2,2,2,2)))
+for (p in products){
+    hist(existing_atributes$Volume[existing_atributes$ProductType == p],
+         main = c(p , 'Sales Volume'), col = brewer.pal(11,'Spectral'))
+}
+```
+```{r}
+hist(existing_atributes$Volume, breaks = 30, probability = TRUE, col = 'coral2',
+     main = 'Distribution of sales volume', xlab = 'Sales Volume')
+lines(density(existing_atributes$Volume), col='blue')
+```
+
+
+Clearly, sales volume ranges from 0 to 2000. There are two clear outliers. From the matrix plot we can distinguish they belong to Accessories and Game Consoles.
+
+###Removing outliers from the dataset
+```{r include=FALSE}
+#create a boxplot
+boxplot <- boxplot(existing_atributes$Volume, las = 2, horizontal = T)
+```
+
+```{r}
+#generate oultier indices (detect the row number they belong in the dataset)
+out_indices <- which(existing_atributes$Volume %in% boxplot$out)
+max_outliers <- c()
+for (i in out_indices){
+    max_outliers <- sort(c(max_outliers, existing_atributes[i,'Volume']), decreasing = T)
+}
+
+#remove the two outliers from the dataset
+row_outlier1 <- which(existing_atributes$Volume == max_outliers[1])
+row_outlier2 <- which(existing_atributes$Volume == max_outliers[2])
+existing_atributes2 <- existing_atributes[c(-row_outlier1, -row_outlier2),]
+```
+
+```{r echo=FALSE}
+par(mfrow=c(2,1), par(mar=c(4,1,4,1)))
+boxplot <- boxplot(existing_atributes$Volume, las = 2, horizontal = T, 
+                   main = 'With Outliers')
+boxplot2 <- boxplot(existing_atributes2$Volume, las = 2, horizontal = T,
+                    main='Without Outliers')
+```
+
+###Visualizing the product distribution
+```{r}
+product_freq <- as.data.frame(table(existing_atributes2$ProductType))
+barplot(product_freq$Freq, col = brewer.pal(11, 'Spectral'), 
+        names.arg = product_freq$Var1, las = 2, main = 'Product Count',
+        ylab = 'Count')
+```
+
+##Feature Selection: Selecting appropiate attributes for the models
+###Check Volume Distribution
+```{r}
+#The variable we want to predict is Volume, so let's make sure the data we have is numerical and greater than zero:
+hist(existing_atributes2$Volume, col = 'coral2', breaks = 50,
+     main = 'Volume Distribution', xlab='')
+```
+###Check for missing values and remove them
+```{r}
+#Let's find out which ProductType has zero sales volume and remove them from the dataset
+zero_index <- which(existing_atributes2$Volume == 0)
+existing_atributes2[zero_index,1]
+#remove zero volume items from dataset
+existing_atributes2 <- existing_atributes2[-c(zero_index),]
+```
+```{r}
+#First let's check if we have missing values at all
+any(is.na(existing_atributes2))
+```
+```{r}
+#Secondly, let's check which column has missing values
+apply(existing_atributes2, 2, function(x) any(is.na(x) | is.infinite(x)))
+```
+```{r}
+#Remove BestSellersRank
+existing_atributes2$BestSellersRank <- NULL
+```
+
+##Feature Engineering and Feature Selection
+###Correlation between Attributes
+
+```{r}
+#Generate a first correlation matrix with all attributes
+CM <- cor(subset(existing_atributes2, select = c(-ProductType, -ProductNum)))#exclude ProductNum since its an identifier and ProductType since its not numerical
+corrplot(CM, method = 'color', tl.col = 'black')
+```
+
+### Colinearity
+
+```{r}
+#Star ratings seem to have a 'suspicious' colinearity
+#generate a new correlation matrix to investigate further
+cor_stars = as.matrix(existing_atributes2[,c(4:8, 17)])
+star_corr_mat = cor(cor_stars)
+corrplot(corr = star_corr_mat, diag = F, method = "number")
+```
+Volume and 5 star have correlation of 1. A correlation of 1 means that there is a perfect linear relation. Hence, knowing the number of 5 stars it's possible to calculate the sales volume.
+
+In the real world this makes no sense. It shows that this dataset might be created artificially. It is true that positive reviews are proportionally correlated to Volume of sales, but not to the point where the proportionality is mathematically perfect.
+
+For tat reason, 5 star reviews attribute will be removed completely.
+Feature engineering will allow us to avoid collinearity among attributes and improve correlation and machine learning processes.
+
+### Remove Attributes
+
+Deleting attributes that are colinear and also attributes that customers are not aware and are irrelevant for a customers' point of view
+```{r}
+existing_atributes2$x5StarReviews <- NULL
+existing_atributes2$x3StarReviews <- NULL
+existing_atributes2$x2StarReviews <- NULL
+existing_atributes2$x1StarReviews <- NULL
+existing_atributes2$ProfitMargin <- NULL
+```
+
+###New Correlation Matrix
+```{r}
+#create second CM
+CM2 <- cor(subset(existing_atributes2, select = c(-ProductType, -ProductNum)))
+corrplot(CM2, method = 'color')
+```
+
+### Attribute Importance
+```{r}
+#by doing a random forest and running VarImp we can see also attributes worth keeping 
+fitControl <- trainControl(
+    method = "repeatedcv", #repeated cross validation
+    number = 10, #number of folds
+    repeats = 3, #times repeated the cv
+    classProbs = FALSE) #shows probability of the output
+
+set.seed(123)
+rffit <- train(Volume~.,
+               data = existing_atributes2,
+               method = "rf",
+               trControl = fitControl,
+               #preProcess = c("range"),
+               verbose = FALSE,
+               importance = TRUE)
+
+#plot variable importance
+rf_highly_correlated <- data.frame(c(varImp(rffit)))
+high_cor_lab <- rownames(rf_highly_correlated)
+par(mfrow=c(1,1), par(mar=c(11,3,2,2)))
+barplot(rf_highly_correlated$Overall, names.arg = high_cor_lab, las = 2, 
+        main = 'Variable Importance on Sales Volume', col = brewer.pal(11,'Spectral'))
+```
+
+## Training Machine Learning Algorithms
+
+```{r}
+set.seed(123)
+train_index <- createDataPartition(existing_atributes2$Volume,
+                                   p = 0.7,
+                                   list = FALSE,
+                                   times = 1)
+
+training <- existing_atributes2[train_index,]
+testing <- existing_atributes2[-train_index,]
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+methods <- c('rf', 'gbm', 'svmRadial', 'knn')
+formulae <- c('Volume ~ x4StarReviews + PositiveServiceReview', 'Volume ~.')
+error_df <- c()
+for(f in formulae){
+    for(m in methods){
+        model <- train(formula(f),
+                       data = training,
+                       method = m,
+                       trControl = fitControl,
+                       verbose = F)
+        prediction <- predict(model, newdata = testing)
+        errors <- postResample(testing$Volume, prediction)
+        error_df <- cbind(error_df,errors)
+    }
+}
+
+```
+```{r include=FALSE}
+x <- as.vector(outer(formulae, methods, paste, sep="."))
+colnames(error_df) <- x
+error_df
+
+error_dfmelt <- melt(error_df, varnames = c("metric", "model"))
+error_dfmelt <- as.data.frame(error_dfmelt)
+error_dfmelt
+```
+```{r}
+ggplot(error_dfmelt, aes(x=model, y=value))+
+ geom_col()+
+ facet_grid(metric~., scales="free") + theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+### Choosing the right algorithm
+
+##Predictions with new dataset
+```{r}
+#import new dataset
+new_attributes <- read.csv('newproductattributes20172.csv')
+```
+
+
+
+```{r echo=TRUE}
+model_rf <- train(Volume~.,
+                       data = training,
+                       method = 'rf',
+                       trControl = fitControl,
+                       verbose = F)
+prediction <- predict(model_rf, newdata = new_attributes)
+new_attributes$PredVolume <- prediction
+```
+
+```{r echo=TRUE}
+f <- new_attributes[,c(1,19)] %>% arrange(desc(PredVolume))
+pc_index <- which(f$ProductType=='PC')
+laptop_index <- which(f$ProductType=='Laptop')
+net_index <- which(f$ProductType=='Netbook')
+sma_index <- which(f$ProductType=='Smartphone')
+
+ind <- c(pc_index, laptop_index, net_index, sma_index)
+f[ind,]%>% arrange(desc(PredVolume))
+```
+
